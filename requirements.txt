@@ -1,0 +1,5 @@
+fastapi==0.111.0
+uvicorn==0.29.0
+pyelftools==0.31
+supabase==2.3.0
+pydantic==2.7.0
