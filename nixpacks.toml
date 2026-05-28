@@ -1,9 +1,9 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "python311Packages.setuptools", "gcc"]
+nixPkgs = ["python311", "python311Packages.pip", "gcc"]
 
 [phases.install]
 cmds = [
-  "pip3 install -r requirements.txt"
+  "pip3 install --break-system-packages -r requirements.txt"
 ]
 
 [start]
