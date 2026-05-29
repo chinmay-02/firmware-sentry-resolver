@@ -272,15 +272,13 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                   f"{result['file']}:{result['line']}")
             return result
 
-        # ── Step 3: DWARF .debug_line — addr2line algorithm ──────────────────
+        # ── Step 3: DWARF .debug_line — exact addr2line algorithm ───────────
         #
-        # addr2line finds the entry with the HIGHEST address that is still <= target.
-        # We do the same: scan the FULL line table, track the best candidate
-        # (closest address from below) for each file seen.
-        # Then prefer application files over IDF/stdlib.
-
-        # best_per_file: { basename -> (line, addr) } — best entry per source file
-        best_per_file = {}
+        # addr2line scans the line table sequentially using prev/curr pairs.
+        # When prev.address <= target < curr.address, prev is the answer.
+        # We collect ALL such matches across all CUs (multiple files can match)
+        # then pick the best application file.
+        all_line_matches = []  # list of (basename, line, addr)
 
         for CU in dwarf.iter_CUs():
             try:
@@ -288,35 +286,33 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                 if li is None:
                     continue
                 lp = li.header
+                prev = None
                 for entry in li.get_entries():
                     if entry.state is None:
                         continue
                     state = entry.state
-                    # Check both address variants
-                    for a in (clean, xtensa):
-                        if state.address <= a:
-                            # This entry is a candidate — closer than previous?
-                            try:
-                                fi = lp.file_entry[state.file - 1]
-                                fname = fi.name.decode('utf-8', errors='replace')
-                                if fi.dir_index > 0:
-                                    d = lp.include_directory[fi.dir_index - 1]
-                                    dname = d.decode('utf-8', errors='replace')
-                                    fname = dname + '/' + fname
-                                basename = fname.split('/')[-1]
-                                prev_best = best_per_file.get(basename)
-                                if prev_best is None or state.address > prev_best[1]:
-                                    best_per_file[basename] = (state.line, state.address)
-                            except Exception:
-                                pass
+                    if prev is not None:
+                        # Check if target falls in [prev.address, state.address)
+                        for a in (clean, xtensa):
+                            if prev.address <= a < state.address:
+                                try:
+                                    fi = lp.file_entry[prev.file - 1]
+                                    fname = fi.name.decode('utf-8', errors='replace')
+                                    if fi.dir_index > 0:
+                                        d = lp.include_directory[fi.dir_index - 1]
+                                        dname = d.decode('utf-8', errors='replace')
+                                        fname = dname + '/' + fname
+                                    basename = fname.split('/')[-1]
+                                    all_line_matches.append((basename, prev.line, prev.address))
+                                except Exception:
+                                    pass
+                                break
+                    prev = state
             except Exception:
                 continue
 
-        # Convert to list sorted by address descending (closest to target first)
-        all_line_matches = [
-            (fname, info[0])
-            for fname, info in sorted(best_per_file.items(), key=lambda x: x[1][1], reverse=True)
-        ]
+        # Sort by address descending — highest addr (closest to target) first
+        all_line_matches.sort(key=lambda x: x[2], reverse=True)
 
         # Pick best match — prefer application files over IDF/stdlib
         # Application files: short names ending in .c/.h, not in known IDF dirs
@@ -337,23 +333,23 @@ def resolve_address(elf_path: str, addr: int) -> dict:
             fname_lower = fname.lower()
             return not any(d in fname_lower for d in idf_dirs)
 
-        # First pass: try to find an application file
-        for fname, line in all_line_matches:
+        # First pass: prefer application files (main.c, sensor.c etc)
+        for fname, line, _ in all_line_matches:
             if is_app_file(fname):
                 result['file'] = fname
                 result['line'] = line
                 print(f"[resolver] debug_line (app): {result['function']} at {fname}:{line}")
                 break
 
-        # Second pass: if no app file found, take any non-stdlib match
+        # Second pass: any non-stdlib match
         if not result['file']:
-            for fname, line in all_line_matches:
+            for fname, line, _ in all_line_matches:
                 if not is_stdlib(fname):
                     result['file'] = fname
                     result['line'] = line
                     print(f"[resolver] debug_line (fallback): {result['function']} at {fname}:{line}")
                     break
-        # If still nothing, leave file/line as None — function name is enough
+        # If still nothing — function name alone is useful enough
 
         # ── Step 5: DWARF .debug_info fallback for function name ──────────────
         if result['function'] is None:
