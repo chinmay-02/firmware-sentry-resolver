@@ -272,34 +272,51 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                   f"{result['file']}:{result['line']}")
             return result
 
-        # ── Step 3: DWARF .debug_line — prefer application files over stdlib ────
+        # ── Step 3: DWARF .debug_line — addr2line algorithm ──────────────────
         #
-        # The line table can have multiple entries covering the same address
-        # (e.g. svfiprintf.c:2344 AND main.c:161 both map to 0x400D9741).
-        # We collect ALL matches and pick the best non-stdlib one.
-        all_line_matches = []  # list of (file_basename, line)
+        # addr2line finds the entry with the HIGHEST address that is still <= target.
+        # We do the same: scan the FULL line table, track the best candidate
+        # (closest address from below) for each file seen.
+        # Then prefer application files over IDF/stdlib.
+
+        # best_per_file: { basename -> (line, addr) } — best entry per source file
+        best_per_file = {}
 
         for CU in dwarf.iter_CUs():
             try:
                 li = dwarf.line_program_for_CU(CU)
                 if li is None:
                     continue
-                prev = None
+                lp = li.header
                 for entry in li.get_entries():
                     if entry.state is None:
                         continue
-                    if prev and (prev.address <= clean  < entry.state.address or
-                                 prev.address <= xtensa < entry.state.address):
-                        lp = li.header
-                        fi = lp.file_entry[prev.file - 1]
-                        fname = fi.name.decode('utf-8', errors='replace')
-                        if fi.dir_index > 0:
-                            d = lp.include_directory[fi.dir_index - 1]
-                            fname = d.decode('utf-8', errors='replace').split('/')[-1] + '/' + fname
-                        all_line_matches.append((fname.split('/')[-1], prev.line))
-                    prev = entry.state
+                    state = entry.state
+                    # Check both address variants
+                    for a in (clean, xtensa):
+                        if state.address <= a:
+                            # This entry is a candidate — closer than previous?
+                            try:
+                                fi = lp.file_entry[state.file - 1]
+                                fname = fi.name.decode('utf-8', errors='replace')
+                                if fi.dir_index > 0:
+                                    d = lp.include_directory[fi.dir_index - 1]
+                                    dname = d.decode('utf-8', errors='replace')
+                                    fname = dname + '/' + fname
+                                basename = fname.split('/')[-1]
+                                prev_best = best_per_file.get(basename)
+                                if prev_best is None or state.address > prev_best[1]:
+                                    best_per_file[basename] = (state.line, state.address)
+                            except Exception:
+                                pass
             except Exception:
                 continue
+
+        # Convert to list sorted by address descending (closest to target first)
+        all_line_matches = [
+            (fname, info[0])
+            for fname, info in sorted(best_per_file.items(), key=lambda x: x[1][1], reverse=True)
+        ]
 
         # Pick best match — prefer application files over IDF/stdlib
         # Application files: short names ending in .c/.h, not in known IDF dirs
@@ -314,6 +331,8 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                 'esp32', 'xtensa', 'riscv', 'soc/', 'hal/',
                 'lwip', 'mbedtls', 'nvs', 'driver/',
                 'efuse', 'wpa', 'ieee802', 'coex',
+                'ubsan', 'sanitizer', 'compiler-rt', 'gcc',
+                'libgcc', 'crtbegin', 'crtstuff',
             ]
             fname_lower = fname.lower()
             return not any(d in fname_lower for d in idf_dirs)
