@@ -270,7 +270,13 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                   f"{result['file']}:{result['line']}")
             return result
 
-        # ── Step 3: DWARF .debug_line fallback ───────────────────────────────
+        # ── Step 3: DWARF .debug_line — prefer application files over stdlib ────
+        #
+        # The line table can have multiple entries covering the same address
+        # (e.g. svfiprintf.c:2344 AND main.c:161 both map to 0x400D9741).
+        # We collect ALL matches and pick the best non-stdlib one.
+        all_line_matches = []  # list of (file_basename, line)
+
         for CU in dwarf.iter_CUs():
             try:
                 li = dwarf.line_program_for_CU(CU)
@@ -288,19 +294,19 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                         if fi.dir_index > 0:
                             d = lp.include_directory[fi.dir_index - 1]
                             fname = d.decode('utf-8', errors='replace').split('/')[-1] + '/' + fname
-                        result['file'] = fname.split('/')[-1]
-                        result['line'] = prev.line
-                        break
+                        all_line_matches.append((fname.split('/')[-1], prev.line))
                     prev = entry.state
-                if result['file']:
-                    break
             except Exception:
                 continue
 
-        # ── Step 4: Filter stdlib from debug_line result ──────────────────────
-        if result['file'] and is_stdlib(result['file']):
-            result['file'] = None
-            result['line'] = None
+        # Prefer the first non-stdlib match (application code)
+        for fname, line in all_line_matches:
+            if not is_stdlib(fname):
+                result['file'] = fname
+                result['line'] = line
+                print(f"[resolver] debug_line: {result['function']} at {fname}:{line}")
+                break
+        # If all matches are stdlib, leave file/line as None (function name is enough)
 
         # ── Step 5: DWARF .debug_info fallback for function name ──────────────
         if result['function'] is None:
