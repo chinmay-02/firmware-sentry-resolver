@@ -1,16 +1,13 @@
 """
 resolver-service/main.py — Firmware Sentry Symbol Resolver Microservice
 
-FastAPI service that wraps pyelftools DWARF resolution.
-Deploy on Railway (free tier) — stays warm, no cold start penalty.
+FastAPI service wrapping pyelftools DWARF resolution with inline frame walking.
+Deploy on Railway — stays warm, no cold start penalty.
 
-Vercel calls this at crash ingest time when elf_uploaded=true.
-Returns resolved symbols → Vercel passes to Claude → better AI diagnosis.
-
-Environment variables (set in Railway dashboard):
-    SUPABASE_URL             — from Supabase project settings
-    SUPABASE_SERVICE_KEY     — service role key (not anon key)
-    RESOLVER_SECRET          — random string, set same in Vercel as RESOLVER_SECRET
+Environment variables:
+    SUPABASE_URL         — Supabase project URL
+    SUPABASE_SERVICE_KEY — service role key
+    RESOLVER_SECRET      — shared secret with Vercel
 """
 
 import os
@@ -29,9 +26,7 @@ SUPABASE_URL    = os.environ['SUPABASE_URL']
 SUPABASE_KEY    = os.environ['SUPABASE_SERVICE_KEY']
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 
-# Stdlib file patterns — these appear when DWARF resolves to an inlined
-# standard library call rather than the actual application source line.
-# We keep the function name but clear the misleading file/line.
+# Stdlib patterns — filter these from file/line results (inlined stdlib frames)
 STDLIB_PATTERNS = [
     'svfiprintf', 'printf', 'vfprintf', 'fprintf', 'sprintf',
     'libc', 'newlib', 'stdio', 'string', 'malloc', 'reent',
@@ -47,7 +42,7 @@ def verify_secret(x_resolver_secret: str = Header(default='')):
         raise HTTPException(status_code=401, detail='Invalid resolver secret')
     return True
 
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class ResolveRequest(BaseModel):
     crash_id:         str
@@ -78,17 +73,10 @@ class ResolveResponse(BaseModel):
 
 def download_elf(org_id: str, group_id: Optional[str],
                  firmware_version: str, build_hash: str) -> Optional[str]:
-    """
-    Download ELF from Supabase Storage.
-    Tries paths in order:
-      1. org/group_id/build_hash.elf          (group-specific, most specific)
-      2. org/firmware_version/build_hash.elf  (version-based fallback)
-      3. Org-wide search across all group folders (catches mismatched group)
-    Returns temp file path or None.
-    """
+    """Download ELF from Supabase Storage. Returns temp file path or None."""
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Specific paths first
+    # Try specific paths first
     paths = []
     if group_id:
         paths.append(f"{org_id}/{group_id}/{build_hash}.elf")
@@ -125,23 +113,189 @@ def download_elf(org_id: str, group_id: Optional[str],
 
     return None
 
-# ── Core DWARF resolver ───────────────────────────────────────────────────────
+# ── Core DWARF resolver with inline frame walking ─────────────────────────────
 
 def resolve_address(elf_path: str, addr: int) -> dict:
-    """Resolve address → function/file/line using DWARF."""
+    """
+    Resolve address → function/file/line using DWARF.
+
+    Algorithm:
+    1. Symbol table (.symtab) → function name (most reliable for ESP32)
+    2. DWARF .debug_info → walk DW_TAG_inlined_subroutine to find the
+       outermost non-stdlib application frame (gives correct file/line)
+    3. DWARF .debug_line → file/line fallback if inline walk fails
+    4. Filter stdlib inlined frames (svfiprintf etc.)
+    """
     result = {'address': f'0x{addr:08X}', 'function': None, 'file': None, 'line': None}
 
-    # Strip Thumb bit (ARM Cortex-M) and CALL8 encoding (Xtensa ESP32)
-    clean   = addr & ~1           # strip Thumb bit
+    # Address variants to try
+    clean   = addr & ~1           # strip ARM Thumb bit
     xtensa  = addr & 0x3FFFFFFF   # strip Xtensa CALL8 top 2 bits
 
     with open(elf_path, 'rb') as f:
         elf = ELFFile(f)
 
-        if elf.has_dwarf_info():
-            dwarf = elf.get_dwarf_info()
+        # ── Step 1: Symbol table → function name ─────────────────────────────
+        symtab = elf.get_section_by_name('.symtab')
+        if symtab:
+            best_fn, best_offset = None, float('inf')
+            for sym in symtab.iter_symbols():
+                if sym['st_info']['type'] not in ('STT_FUNC', 'STT_NOTYPE'):
+                    continue
+                saddr = sym['st_value'] & ~1   # strip Thumb bit from symbol
+                ssize = sym['st_size']
+                for a in (clean, xtensa):
+                    if saddr <= a < saddr + max(ssize, 1):
+                        offset = a - saddr
+                        if offset < best_offset:
+                            best_offset = offset
+                            best_fn = sym.name
+            if best_fn:
+                result['function'] = best_fn
 
-            # 1. DWARF .debug_info — function name via DW_TAG_subprogram
+        if not elf.has_dwarf_info():
+            return result
+
+        dwarf = elf.get_dwarf_info()
+
+        # ── Step 2: Inline frame walking via DW_TAG_inlined_subroutine ────────
+        #
+        # When the compiler inlines a function (e.g. snprintf into app_main),
+        # DWARF records this as a DW_TAG_inlined_subroutine child DIE inside
+        # the parent DW_TAG_subprogram. The call site attributes
+        # DW_AT_call_file and DW_AT_call_line give us the exact source line
+        # in the OUTER (application) code where the inlined call originated.
+        #
+        # Strategy: for our address, find the deepest inline frame that is
+        # NOT a stdlib function. That gives us the real application file/line.
+
+        def get_die_name(die) -> Optional[str]:
+            name_attr = die.attributes.get('DW_AT_name')
+            if name_attr:
+                v = name_attr.value
+                return v.decode('utf-8', errors='replace') if isinstance(v, bytes) else str(v)
+            # Try DW_AT_abstract_origin / DW_AT_specification for name
+            for ref_attr in ('DW_AT_abstract_origin', 'DW_AT_specification'):
+                ref = die.attributes.get(ref_attr)
+                if ref:
+                    try:
+                        ref_die = die.cu.get_DIE_from_refaddr(ref.value + die.cu.cu_offset)
+                        n = ref_die.attributes.get('DW_AT_name')
+                        if n:
+                            v = n.value
+                            return v.decode('utf-8', errors='replace') if isinstance(v, bytes) else str(v)
+                    except Exception:
+                        pass
+            return None
+
+        def die_contains_addr(die) -> bool:
+            low = die.attributes.get('DW_AT_low_pc')
+            high = die.attributes.get('DW_AT_high_pc')
+            if not (low and high):
+                return False
+            lo = low.value
+            hi = high.value if high.form == 'DW_FORM_addr' else lo + high.value
+            for a in (clean, xtensa):
+                if lo <= a < hi:
+                    return True
+            return False
+
+        def get_file_name(cu, file_idx: int) -> Optional[str]:
+            """Get filename from DWARF line program file table."""
+            try:
+                lp = dwarf.line_program_for_CU(cu)
+                if lp is None:
+                    return None
+                entries = lp.header.get('file_entry', [])
+                if 0 < file_idx <= len(entries):
+                    fe = entries[file_idx - 1]
+                    name = fe.name
+                    fname = name.decode('utf-8', errors='replace') if isinstance(name, bytes) else str(name)
+                    return fname.split('/')[-1]  # basename only
+            except Exception:
+                pass
+            return None
+
+        def is_stdlib(name: Optional[str]) -> bool:
+            if not name:
+                return False
+            return any(p in name.lower() for p in STDLIB_PATTERNS)
+
+        # Walk all CUs looking for inlined frames at our address
+        best_app_frame = None  # (file, line) of outermost non-stdlib frame
+
+        for CU in dwarf.iter_CUs():
+            for DIE in CU.iter_DIEs():
+                if DIE.tag != 'DW_TAG_subprogram':
+                    continue
+                if not die_contains_addr(DIE):
+                    continue
+
+                # This subprogram contains our address — walk its children
+                # for inlined subroutines
+                for child in DIE.iter_children():
+                    if child.tag != 'DW_TAG_inlined_subroutine':
+                        continue
+                    if not die_contains_addr(child):
+                        continue
+
+                    # This inlined call contains our address
+                    # DW_AT_call_file + DW_AT_call_line = where it was called FROM
+                    # (the application source line we want)
+                    call_file_attr = child.attributes.get('DW_AT_call_file')
+                    call_line_attr = child.attributes.get('DW_AT_call_line')
+
+                    if call_file_attr and call_line_attr:
+                        fname = get_file_name(CU, call_file_attr.value)
+                        line  = call_line_attr.value
+
+                        # Skip if this is itself a stdlib call site
+                        inline_name = get_die_name(child)
+                        if not is_stdlib(fname) and not is_stdlib(inline_name):
+                            best_app_frame = (fname, line)
+                            # Don't break — keep walking for deeper inlines
+                            # (we want the outermost application frame)
+
+        if best_app_frame:
+            result['file'], result['line'] = best_app_frame
+            print(f"[resolver] Inline walk: {result['function']} at "
+                  f"{result['file']}:{result['line']}")
+            return result
+
+        # ── Step 3: DWARF .debug_line fallback ───────────────────────────────
+        for CU in dwarf.iter_CUs():
+            try:
+                li = dwarf.line_program_for_CU(CU)
+                if li is None:
+                    continue
+                prev = None
+                for entry in li.get_entries():
+                    if entry.state is None:
+                        continue
+                    if prev and (prev.address <= clean  < entry.state.address or
+                                 prev.address <= xtensa < entry.state.address):
+                        lp = li.header
+                        fi = lp.file_entry[prev.file - 1]
+                        fname = fi.name.decode('utf-8', errors='replace')
+                        if fi.dir_index > 0:
+                            d = lp.include_directory[fi.dir_index - 1]
+                            fname = d.decode('utf-8', errors='replace').split('/')[-1] + '/' + fname
+                        result['file'] = fname.split('/')[-1]
+                        result['line'] = prev.line
+                        break
+                    prev = entry.state
+                if result['file']:
+                    break
+            except Exception:
+                continue
+
+        # ── Step 4: Filter stdlib from debug_line result ──────────────────────
+        if result['file'] and is_stdlib(result['file']):
+            result['file'] = None
+            result['line'] = None
+
+        # ── Step 5: DWARF .debug_info fallback for function name ──────────────
+        if result['function'] is None:
             for CU in dwarf.iter_CUs():
                 for DIE in CU.iter_DIEs():
                     if DIE.tag != 'DW_TAG_subprogram':
@@ -154,57 +308,14 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                             continue
                         lo = low.value
                         hi = high.value if high.form == 'DW_FORM_addr' else lo + high.value
-                        if lo <= clean < hi or lo <= xtensa < hi:
-                            result['function'] = name.value.decode('utf-8', errors='replace')
+                        for a in (clean, xtensa):
+                            if lo <= a < hi:
+                                result['function'] = name.value.decode('utf-8', errors='replace')
+                                break
                     except Exception:
                         continue
-
-            # 2. DWARF .debug_line — file and line number
-            for CU in dwarf.iter_CUs():
-                try:
-                    li = dwarf.line_program_for_CU(CU)
-                    if li is None:
-                        continue
-                    prev = None
-                    for entry in li.get_entries():
-                        if entry.state is None:
-                            continue
-                        if prev and (prev.address <= clean  < entry.state.address or
-                                     prev.address <= xtensa < entry.state.address):
-                            lp = li.header
-                            fi = lp.file_entry[prev.file - 1]
-                            fname = fi.name.decode('utf-8', errors='replace')
-                            if fi.dir_index > 0:
-                                d = lp.include_directory[fi.dir_index - 1]
-                                fname = d.decode('utf-8', errors='replace').split('/')[-1] + '/' + fname
-                            result['file'] = fname.split('/')[-1]   # basename only
-                            result['line'] = prev.line
-                            break
-                        prev = entry.state
-                except Exception:
-                    continue
-
-        # 3. Filter stdlib inlined frames — keep function name, clear misleading file/line
-        #    e.g. svfiprintf.c:2344 appears when printf is inlined into app_main()
-        if result['file'] and any(p in result['file'].lower() for p in STDLIB_PATTERNS):
-            result['file'] = None
-            result['line'] = None
-
-        # 4. Fallback — symbol table (.symtab) when DWARF has no debug_info
-        if result['function'] is None:
-            symtab = elf.get_section_by_name('.symtab')
-            if symtab:
-                best = None
-                for sym in symtab.iter_symbols():
-                    if sym['st_info']['type'] not in ('STT_FUNC', 'STT_NOTYPE'):
-                        continue
-                    saddr = sym['st_value']
-                    ssize = sym['st_size']
-                    if saddr <= clean < saddr + max(ssize, 1):
-                        if best is None or ssize < best[1]:
-                            best = (sym.name, ssize)
-                if best:
-                    result['function'] = best[0]
+                if result['function']:
+                    break
 
     return result
 
@@ -214,7 +325,7 @@ def analyse_stack(stack_hex: str, platform: str) -> dict:
     """Extract flash addresses and ASCII strings from raw stack dump."""
     if platform == 'esp32':
         flash_lo, flash_hi = 0x400C0000, 0x40280000
-    else:   # cortex_m
+    else:
         flash_lo, flash_hi = 0x08000000, 0x08200000
 
     try:
@@ -252,32 +363,31 @@ def health():
 def resolve(req: ResolveRequest, _auth=Depends(verify_secret)):
     print(f"[resolver] crash={req.crash_id}  build={req.build_hash}  pc={req.pc}")
 
-    # 1. Download ELF
     elf_path = download_elf(req.org_id, req.group_id, req.firmware_version, req.build_hash)
     if not elf_path:
         print(f"[resolver] No ELF found for build_hash={req.build_hash}")
         return ResolveResponse(resolved=False, reason='ELF not found for this build_hash')
 
     try:
-        # 2. Resolve PC
-        pc_int      = int(req.pc, 16)
-        pc_resolved = resolve_address(elf_path, pc_int)
+        # Resolve PC
+        pc_resolved = resolve_address(elf_path, int(req.pc, 16))
         print(f"[resolver] PC {req.pc} → {pc_resolved['function'] or '?'} "
               f"at {pc_resolved['file'] or '?'}:{pc_resolved['line'] or '?'}")
 
-        # 3. Resolve LR
+        # Resolve LR
         lr_resolved = None
         if req.lr:
             try:
                 lr_resolved = resolve_address(elf_path, int(req.lr, 16))
-                print(f"[resolver] LR {req.lr} → {lr_resolved['function'] or '?'}")
+                print(f"[resolver] LR {req.lr} → {lr_resolved['function'] or '?'} "
+                      f"at {lr_resolved['file'] or '?'}:{lr_resolved['line'] or '?'}")
             except Exception as e:
                 print(f"[resolver] LR resolve failed: {e}")
 
-        # 4. Stack analysis — call chain + strings
+        # Stack analysis
         call_chain, stack_strings = [], []
         if req.stack_data:
-            analysis     = analyse_stack(req.stack_data, req.platform)
+            analysis      = analyse_stack(req.stack_data, req.platform)
             stack_strings = analysis['strings']
             for entry in analysis['flash_addresses'][:8]:
                 resolved = resolve_address(elf_path, entry['value'])
