@@ -36,6 +36,8 @@ STDLIB_PATTERNS = [
     'vsnprintf', 'snprintf', 'puts', 'fputs',
     # ESP-IDF internals
     'esp_app_desc', 'esp_system', 'esp_common', 'esp_hw_support',
+    'esp_efuse', 'efuse', 'esp_phy', 'esp_wifi', 'esp_partition',
+    'esp_flash', 'spi_flash', 'nvs_flash', 'esp_https',
     'esp_rom', 'soc', 'hal/', 'esp_event', 'esp_netif',
     'freertos', 'FreeRTOS', 'port.c', 'tasks.c', 'queue.c',
     'app_startup', 'cpu_start', 'startup',
@@ -299,14 +301,40 @@ def resolve_address(elf_path: str, addr: int) -> dict:
             except Exception:
                 continue
 
-        # Prefer the first non-stdlib match (application code)
+        # Pick best match — prefer application files over IDF/stdlib
+        # Application files: short names ending in .c/.h, not in known IDF dirs
+        def is_app_file(fname: str) -> bool:
+            if not fname or not fname.endswith(('.c', '.h')):
+                return False
+            if is_stdlib(fname):
+                return False
+            # Reject IDF component paths
+            idf_dirs = [
+                'components/', 'esp-idf/', '/idf/', 'esp_idf',
+                'esp32', 'xtensa', 'riscv', 'soc/', 'hal/',
+                'lwip', 'mbedtls', 'nvs', 'driver/',
+                'efuse', 'wpa', 'ieee802', 'coex',
+            ]
+            fname_lower = fname.lower()
+            return not any(d in fname_lower for d in idf_dirs)
+
+        # First pass: try to find an application file
         for fname, line in all_line_matches:
-            if not is_stdlib(fname):
+            if is_app_file(fname):
                 result['file'] = fname
                 result['line'] = line
-                print(f"[resolver] debug_line: {result['function']} at {fname}:{line}")
+                print(f"[resolver] debug_line (app): {result['function']} at {fname}:{line}")
                 break
-        # If all matches are stdlib, leave file/line as None (function name is enough)
+
+        # Second pass: if no app file found, take any non-stdlib match
+        if not result['file']:
+            for fname, line in all_line_matches:
+                if not is_stdlib(fname):
+                    result['file'] = fname
+                    result['line'] = line
+                    print(f"[resolver] debug_line (fallback): {result['function']} at {fname}:{line}")
+                    break
+        # If still nothing, leave file/line as None — function name is enough
 
         # ── Step 5: DWARF .debug_info fallback for function name ──────────────
         if result['function'] is None:
