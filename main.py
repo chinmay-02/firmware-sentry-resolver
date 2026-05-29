@@ -26,11 +26,19 @@ SUPABASE_URL    = os.environ['SUPABASE_URL']
 SUPABASE_KEY    = os.environ['SUPABASE_SERVICE_KEY']
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 
-# Stdlib patterns — filter these from file/line results (inlined stdlib frames)
+# Patterns to filter from file/line results.
+# These appear when DWARF resolves to inlined stdlib or IDF internal frames
+# rather than the actual application source line.
 STDLIB_PATTERNS = [
+    # C stdlib
     'svfiprintf', 'printf', 'vfprintf', 'fprintf', 'sprintf',
     'libc', 'newlib', 'stdio', 'string', 'malloc', 'reent',
     'vsnprintf', 'snprintf', 'puts', 'fputs',
+    # ESP-IDF internals
+    'esp_app_desc', 'esp_system', 'esp_common', 'esp_hw_support',
+    'esp_rom', 'soc', 'hal/', 'esp_event', 'esp_netif',
+    'freertos', 'FreeRTOS', 'port.c', 'tasks.c', 'queue.c',
+    'app_startup', 'cpu_start', 'startup',
 ]
 
 app = FastAPI(title="Firmware Sentry Symbol Resolver", version="1.0.0")
@@ -246,15 +254,15 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                     call_line_attr = child.attributes.get('DW_AT_call_line')
 
                     if call_file_attr and call_line_attr:
-                        fname = get_file_name(CU, call_file_attr.value)
-                        line  = call_line_attr.value
-
-                        # Skip if this is itself a stdlib call site
+                        fname       = get_file_name(CU, call_file_attr.value)
+                        line        = call_line_attr.value
                         inline_name = get_die_name(child)
+
+                        # Only accept application code — skip stdlib and IDF internals
+                        # Keep updating best_app_frame so we end up with the
+                        # OUTERMOST non-stdlib frame (the real application call site)
                         if not is_stdlib(fname) and not is_stdlib(inline_name):
                             best_app_frame = (fname, line)
-                            # Don't break — keep walking for deeper inlines
-                            # (we want the outermost application frame)
 
         if best_app_frame:
             result['file'], result['line'] = best_app_frame
