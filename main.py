@@ -101,27 +101,39 @@ class ResolveResponse(BaseModel):
 
 # ── ELF download ──────────────────────────────────────────────────────────────
 
-def download_elf(org_id: str, group_id: Optional[str],
-                 firmware_version: str, build_hash: str) -> Optional[str]:
-    """Download ELF from Supabase Storage. Returns temp file path or None."""
+def download_elf(org_id, group_id, firmware_version, build_hash):
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+    
+    # Try all possible paths — group-specific first, then org-wide search
     paths = []
     if group_id:
         paths.append(f"{org_id}/{group_id}/{build_hash}.elf")
     paths.append(f"{org_id}/{firmware_version}/{build_hash}.elf")
-
+    
     for path in paths:
         try:
             data = sb.storage.from_('elf-files').download(path)
             tmp = tempfile.NamedTemporaryFile(suffix='.elf', delete=False)
-            tmp.write(data)
-            tmp.close()
-            print(f"[resolver] ELF downloaded: {path} ({len(data):,} bytes)")
+            tmp.write(data); tmp.close()
             return tmp.name
-        except Exception as e:
-            print(f"[resolver] ELF path not found: {path} — {e}")
+        except:
             continue
+
+    # FIX: search ALL groups in this org for matching build_hash
+    try:
+        files = sb.storage.from_('elf-files').list(org_id)
+        for folder in (files or []):
+            candidate = f"{org_id}/{folder['name']}/{build_hash}.elf"
+            try:
+                data = sb.storage.from_('elf-files').download(candidate)
+                tmp = tempfile.NamedTemporaryFile(suffix='.elf', delete=False)
+                tmp.write(data); tmp.close()
+                print(f"[resolver] Found ELF via org-wide search: {candidate}")
+                return tmp.name
+            except:
+                continue
+    except Exception as e:
+        print(f"[resolver] Org-wide search failed: {e}")
 
     return None
 
