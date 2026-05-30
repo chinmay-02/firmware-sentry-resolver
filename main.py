@@ -79,14 +79,19 @@ class ResolveResponse(BaseModel):
     call_chain:    list                     = []
     stack_strings: list                     = []
 
+# ── ELF cache — persists between requests (Railway is always-on) ─────────────
+import threading
+_elf_cache: dict = {}          # build_hash → temp file path
+_elf_cache_lock = threading.Lock()
+_ELF_CACHE_MAX = 3             # keep at most 3 ELFs in memory
+
 # ── ELF download ──────────────────────────────────────────────────────────────
 
-def download_elf(org_id: str, group_id: Optional[str],
-                 firmware_version: str, build_hash: str) -> Optional[str]:
+def _download_elf_raw(org_id: str, group_id: Optional[str],
+                      firmware_version: str, build_hash: str) -> Optional[str]:
     """Download ELF from Supabase Storage. Returns temp file path or None."""
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Try specific paths first
     paths = []
     if group_id:
         paths.append(f"{org_id}/{group_id}/{build_hash}.elf")
@@ -104,7 +109,7 @@ def download_elf(org_id: str, group_id: Optional[str],
             print(f"[resolver] Path not found: {path} — {e}")
             continue
 
-    # Org-wide search — handles build_hash stored under a different group
+    # Org-wide search
     try:
         folders = sb.storage.from_('elf-files').list(org_id)
         for folder in (folders or []):
@@ -122,6 +127,36 @@ def download_elf(org_id: str, group_id: Optional[str],
         print(f"[resolver] Org-wide search failed: {e}")
 
     return None
+
+
+def download_elf(org_id: str, group_id: Optional[str],
+                 firmware_version: str, build_hash: str) -> Optional[str]:
+    """Return cached ELF path or download fresh. Cache survives between requests."""
+    with _elf_cache_lock:
+        if build_hash in _elf_cache:
+            cached = _elf_cache[build_hash]
+            if os.path.exists(cached):
+                print(f"[resolver] ELF cache hit: {build_hash}")
+                return cached
+            del _elf_cache[build_hash]   # stale entry
+
+    # Download fresh (outside lock — can be slow)
+    elf_path = _download_elf_raw(org_id, group_id, firmware_version, build_hash)
+
+    if elf_path:
+        with _elf_cache_lock:
+            # Evict oldest if cache is full
+            if len(_elf_cache) >= _ELF_CACHE_MAX:
+                oldest_key = next(iter(_elf_cache))
+                try:
+                    os.unlink(_elf_cache[oldest_key])
+                except Exception:
+                    pass
+                del _elf_cache[oldest_key]
+            _elf_cache[build_hash] = elf_path
+            print(f"[resolver] ELF cached: {build_hash} ({len(_elf_cache)}/{_ELF_CACHE_MAX} slots used)")
+
+    return elf_path
 
 # ── Core DWARF resolver with inline frame walking ─────────────────────────────
 
@@ -464,7 +499,4 @@ def resolve(req: ResolveRequest, _auth=Depends(verify_secret)):
         return ResolveResponse(resolved=False, reason=str(e))
 
     finally:
-        try:
-            os.unlink(elf_path)
-        except Exception:
-            pass
+        pass  # ELF is kept in cache for subsequent requests
