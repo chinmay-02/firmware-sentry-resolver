@@ -13,6 +13,7 @@ Environment variables:
 import os
 import tempfile
 import struct
+import gc
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -83,7 +84,7 @@ class ResolveResponse(BaseModel):
 import threading
 _elf_cache: dict = {}          # build_hash → temp file path
 _elf_cache_lock = threading.Lock()
-_ELF_CACHE_MAX = 3             # keep at most 3 ELFs in memory
+_ELF_CACHE_MAX = 1             # keep at most 3 ELFs in memory
 
 # ── ELF download ──────────────────────────────────────────────────────────────
 
@@ -414,7 +415,7 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                         continue
                 if result['function']:
                     break
-
+    gc.collect()
     return result
 
 # ── Stack analysis ────────────────────────────────────────────────────────────
