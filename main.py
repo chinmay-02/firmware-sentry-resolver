@@ -187,6 +187,9 @@ def resolve_address(elf_path: str, addr: int) -> dict:
             for sym in symtab.iter_symbols():
                 if sym['st_info']['type'] not in ('STT_FUNC', 'STT_NOTYPE'):
                     continue
+                # Filter ARM mapping symbols ($t=Thumb, $d=data, $a=ARM, $x=mixed)
+                if sym.name in ('$t', '$d', '$a', '$x'):
+                    continue
                 saddr = sym['st_value'] & ~1   # strip Thumb bit from symbol
                 ssize = sym['st_size']
                 for a in (clean, xtensa):
@@ -364,6 +367,9 @@ def resolve_address(elf_path: str, addr: int) -> dict:
                 'efuse', 'wpa', 'ieee802', 'coex',
                 'ubsan', 'sanitizer', 'compiler-rt', 'gcc',
                 'libgcc', 'crtbegin', 'crtstuff',
+                # STM32 HAL internals
+                'stm32l4xx_it', 'stm32l4xx_hal', 'system_stm32',
+                'cmsis', 'freertos', 'syscalls', 'sysmem',
             ]
             fname_lower = fname.lower()
             return not any(d in fname_lower for d in idf_dirs)
