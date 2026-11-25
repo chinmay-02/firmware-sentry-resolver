@@ -13,12 +13,13 @@ Environment variables:
 import os
 import tempfile
 import struct
-import gc
+import subprocess
+import re
+import hmac
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-from elftools.elf.elffile import ELFFile
 from supabase import create_client
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -49,7 +50,8 @@ app = FastAPI(title="Firmware Sentry Symbol Resolver", version="1.0.0")
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def verify_secret(x_resolver_secret: str = Header(default='')):
-    if RESOLVER_SECRET and x_resolver_secret != RESOLVER_SECRET:
+    # Never turn off authentication accidentally by omitting the secret.
+    if not RESOLVER_SECRET or not hmac.compare_digest(x_resolver_secret, RESOLVER_SECRET):
         raise HTTPException(status_code=401, detail='Invalid resolver secret')
     return True
 
@@ -82,7 +84,7 @@ class ResolveResponse(BaseModel):
 
 # ── ELF cache — persists between requests (Railway is always-on) ─────────────
 import threading
-_elf_cache: dict = {}          # build_hash → temp file path
+_elf_cache: dict = {}          # (org, group, version, build) → temp path
 _elf_cache_lock = threading.Lock()
 _ELF_CACHE_MAX = 1             # keep at most 3 ELFs in memory
 
@@ -110,36 +112,27 @@ def _download_elf_raw(org_id: str, group_id: Optional[str],
             print(f"[resolver] Path not found: {path} — {e}")
             continue
 
-    # Org-wide search
-    try:
-        folders = sb.storage.from_('elf-files').list(org_id)
-        for folder in (folders or []):
-            candidate = f"{org_id}/{folder['name']}/{build_hash}.elf"
-            try:
-                data = sb.storage.from_('elf-files').download(candidate)
-                tmp = tempfile.NamedTemporaryFile(suffix='.elf', delete=False)
-                tmp.write(data)
-                tmp.close()
-                print(f"[resolver] Found via org-wide search: {candidate} ({len(data):,} bytes)")
-                return tmp.name
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[resolver] Org-wide search failed: {e}")
-
+    # No org-wide fallback: it could use the wrong firmware version's ELF.
     return None
 
 
 def download_elf(org_id: str, group_id: Optional[str],
                  firmware_version: str, build_hash: str) -> Optional[str]:
     """Return cached ELF path or download fresh. Cache survives between requests."""
+    # Prevent cross-tenant cache matches and path manipulation.
+    for segment in (org_id, firmware_version, build_hash):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", segment) or ".." in segment:
+            raise ValueError("Invalid ELF storage path segment")
+    if group_id is not None and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", group_id) or ".." in group_id):
+        raise ValueError("Invalid group identifier")
+    cache_key = (org_id, group_id, firmware_version, build_hash)
     with _elf_cache_lock:
-        if build_hash in _elf_cache:
-            cached = _elf_cache[build_hash]
+        if cache_key in _elf_cache:
+            cached = _elf_cache[cache_key]
             if os.path.exists(cached):
                 print(f"[resolver] ELF cache hit: {build_hash}")
                 return cached
-            del _elf_cache[build_hash]   # stale entry
+            del _elf_cache[cache_key]   # stale entry
 
     # Download fresh (outside lock — can be slow)
     elf_path = _download_elf_raw(org_id, group_id, firmware_version, build_hash)
@@ -154,268 +147,45 @@ def download_elf(org_id: str, group_id: Optional[str],
                 except Exception:
                     pass
                 del _elf_cache[oldest_key]
-            _elf_cache[build_hash] = elf_path
+            _elf_cache[cache_key] = elf_path
             print(f"[resolver] ELF cached: {build_hash} ({len(_elf_cache)}/{_ELF_CACHE_MAX} slots used)")
 
     return elf_path
 
-# ── Core DWARF resolver with inline frame walking ─────────────────────────────
+# ── Native low-memory symbolization ─────────────────────────────
 
 def resolve_address(elf_path: str, addr: int) -> dict:
+    """Resolve PC with GNU binutils rather than loading DWARF into Python RAM.
+
+    addr2line performs the same lookup in a bounded subprocess. Never invoke
+    a shell or allow untrusted values to supply command-line options.
     """
-    Resolve address → function/file/line using DWARF.
+    if not isinstance(addr, int) or not 0 <= addr <= 0xFFFFFFFF:
+        raise ValueError("Invalid 32-bit instruction address")
 
-    Algorithm:
-    1. Symbol table (.symtab) → function name (most reliable for ESP32)
-    2. DWARF .debug_info → walk DW_TAG_inlined_subroutine to find the
-       outermost non-stdlib application frame (gives correct file/line)
-    3. DWARF .debug_line → file/line fallback if inline walk fails
-    4. Filter stdlib inlined frames (svfiprintf etc.)
-    """
-    result = {'address': f'0x{addr:08X}', 'function': None, 'file': None, 'line': None}
-
-    # Address variants to try
-    clean   = addr & ~1           # strip ARM Thumb bit
-    xtensa  = addr & 0x3FFFFFFF   # strip Xtensa CALL8 top 2 bits
-
-    with open(elf_path, 'rb') as f:
-        elf = ELFFile(f)
-
-        # ── Step 1: Symbol table → function name ─────────────────────────────
-        symtab = elf.get_section_by_name('.symtab')
-        if symtab:
-            best_fn, best_offset = None, float('inf')
-            for sym in symtab.iter_symbols():
-                if sym['st_info']['type'] not in ('STT_FUNC', 'STT_NOTYPE'):
-                    continue
-                # Filter ARM mapping symbols ($t=Thumb, $d=data, $a=ARM, $x=mixed)
-                if sym.name in ('$t', '$d', '$a', '$x'):
-                    continue
-                saddr = sym['st_value'] & ~1   # strip Thumb bit from symbol
-                ssize = sym['st_size']
-                for a in (clean, xtensa):
-                    if saddr <= a < saddr + max(ssize, 1):
-                        offset = a - saddr
-                        if offset < best_offset:
-                            best_offset = offset
-                            best_fn = sym.name
-            if best_fn:
-                result['function'] = best_fn
-
-        if not elf.has_dwarf_info():
-            return result
-
-        dwarf = elf.get_dwarf_info()
-
-        # ── Step 2: Inline frame walking via DW_TAG_inlined_subroutine ────────
-        #
-        # When the compiler inlines a function (e.g. snprintf into app_main),
-        # DWARF records this as a DW_TAG_inlined_subroutine child DIE inside
-        # the parent DW_TAG_subprogram. The call site attributes
-        # DW_AT_call_file and DW_AT_call_line give us the exact source line
-        # in the OUTER (application) code where the inlined call originated.
-        #
-        # Strategy: for our address, find the deepest inline frame that is
-        # NOT a stdlib function. That gives us the real application file/line.
-
-        def get_die_name(die) -> Optional[str]:
-            name_attr = die.attributes.get('DW_AT_name')
-            if name_attr:
-                v = name_attr.value
-                return v.decode('utf-8', errors='replace') if isinstance(v, bytes) else str(v)
-            # Try DW_AT_abstract_origin / DW_AT_specification for name
-            for ref_attr in ('DW_AT_abstract_origin', 'DW_AT_specification'):
-                ref = die.attributes.get(ref_attr)
-                if ref:
-                    try:
-                        ref_die = die.cu.get_DIE_from_refaddr(ref.value + die.cu.cu_offset)
-                        n = ref_die.attributes.get('DW_AT_name')
-                        if n:
-                            v = n.value
-                            return v.decode('utf-8', errors='replace') if isinstance(v, bytes) else str(v)
-                    except Exception:
-                        pass
-            return None
-
-        def die_contains_addr(die) -> bool:
-            low = die.attributes.get('DW_AT_low_pc')
-            high = die.attributes.get('DW_AT_high_pc')
-            if not (low and high):
-                return False
-            lo = low.value
-            hi = high.value if high.form == 'DW_FORM_addr' else lo + high.value
-            for a in (clean, xtensa):
-                if lo <= a < hi:
-                    return True
-            return False
-
-        def get_file_name(cu, file_idx: int) -> Optional[str]:
-            """Get filename from DWARF line program file table."""
-            try:
-                lp = dwarf.line_program_for_CU(cu)
-                if lp is None:
-                    return None
-                entries = lp.header.get('file_entry', [])
-                if 0 < file_idx <= len(entries):
-                    fe = entries[file_idx - 1]
-                    name = fe.name
-                    fname = name.decode('utf-8', errors='replace') if isinstance(name, bytes) else str(name)
-                    return fname.split('/')[-1]  # basename only
-            except Exception:
-                pass
-            return None
-
-        def is_stdlib(name: Optional[str]) -> bool:
-            if not name:
-                return False
-            return any(p in name.lower() for p in STDLIB_PATTERNS)
-
-        # Walk all CUs looking for inlined frames at our address
-        best_app_frame = None  # (file, line) of outermost non-stdlib frame
-
-        for CU in dwarf.iter_CUs():
-            for DIE in CU.iter_DIEs():
-                if DIE.tag != 'DW_TAG_subprogram':
-                    continue
-                if not die_contains_addr(DIE):
-                    continue
-
-                # This subprogram contains our address — walk its children
-                # for inlined subroutines
-                for child in DIE.iter_children():
-                    if child.tag != 'DW_TAG_inlined_subroutine':
-                        continue
-                    if not die_contains_addr(child):
-                        continue
-
-                    # This inlined call contains our address
-                    # DW_AT_call_file + DW_AT_call_line = where it was called FROM
-                    # (the application source line we want)
-                    call_file_attr = child.attributes.get('DW_AT_call_file')
-                    call_line_attr = child.attributes.get('DW_AT_call_line')
-
-                    if call_file_attr and call_line_attr:
-                        fname       = get_file_name(CU, call_file_attr.value)
-                        line        = call_line_attr.value
-                        inline_name = get_die_name(child)
-
-                        # Only accept application code — skip stdlib and IDF internals
-                        # Keep updating best_app_frame so we end up with the
-                        # OUTERMOST non-stdlib frame (the real application call site)
-                        if not is_stdlib(fname) and not is_stdlib(inline_name):
-                            best_app_frame = (fname, line)
-
-        if best_app_frame:
-            result['file'], result['line'] = best_app_frame
-            print(f"[resolver] Inline walk: {result['function']} at "
-                  f"{result['file']}:{result['line']}")
-            return result
-
-        # ── Step 3: DWARF .debug_line — exact addr2line algorithm ───────────
-        #
-        # addr2line scans the line table sequentially using prev/curr pairs.
-        # When prev.address <= target < curr.address, prev is the answer.
-        # We collect ALL such matches across all CUs (multiple files can match)
-        # then pick the best application file.
-        all_line_matches = []  # list of (basename, line, addr)
-
-        for CU in dwarf.iter_CUs():
-            try:
-                li = dwarf.line_program_for_CU(CU)
-                if li is None:
-                    continue
-                lp = li.header
-                prev = None
-                for entry in li.get_entries():
-                    if entry.state is None:
-                        continue
-                    state = entry.state
-                    if prev is not None:
-                        # Check if target falls in [prev.address, state.address)
-                        for a in (clean, xtensa):
-                            if prev.address <= a < state.address:
-                                try:
-                                    fi = lp.file_entry[prev.file - 1]
-                                    fname = fi.name.decode('utf-8', errors='replace')
-                                    if fi.dir_index > 0:
-                                        d = lp.include_directory[fi.dir_index - 1]
-                                        dname = d.decode('utf-8', errors='replace')
-                                        fname = dname + '/' + fname
-                                    basename = fname.split('/')[-1]
-                                    all_line_matches.append((basename, prev.line, prev.address))
-                                except Exception:
-                                    pass
-                                break
-                    prev = state
-            except Exception:
-                continue
-
-        # Sort by address descending — highest addr (closest to target) first
-        all_line_matches.sort(key=lambda x: x[2], reverse=True)
-
-        # Pick best match — prefer application files over IDF/stdlib
-        # Application files: short names ending in .c/.h, not in known IDF dirs
-        def is_app_file(fname: str) -> bool:
-            if not fname or not fname.endswith(('.c', '.h')):
-                return False
-            if is_stdlib(fname):
-                return False
-            # Reject IDF component paths
-            idf_dirs = [
-                'components/', 'esp-idf/', '/idf/', 'esp_idf',
-                'esp32', 'xtensa', 'riscv', 'soc/', 'hal/',
-                'lwip', 'mbedtls', 'nvs', 'driver/',
-                'efuse', 'wpa', 'ieee802', 'coex',
-                'ubsan', 'sanitizer', 'compiler-rt', 'gcc',
-                'libgcc', 'crtbegin', 'crtstuff',
-                # STM32 HAL internals
-                'stm32l4xx_it', 'stm32l4xx_hal', 'system_stm32',
-                'cmsis', 'freertos', 'syscalls', 'sysmem',
-            ]
-            fname_lower = fname.lower()
-            return not any(d in fname_lower for d in idf_dirs)
-
-        # First pass: prefer application files (main.c, sensor.c etc)
-        for fname, line, _ in all_line_matches:
-            if is_app_file(fname):
-                result['file'] = fname
-                result['line'] = line
-                print(f"[resolver] debug_line (app): {result['function']} at {fname}:{line}")
-                break
-
-        # Second pass: any non-stdlib match
-        if not result['file']:
-            for fname, line, _ in all_line_matches:
-                if not is_stdlib(fname):
-                    result['file'] = fname
-                    result['line'] = line
-                    print(f"[resolver] debug_line (fallback): {result['function']} at {fname}:{line}")
-                    break
-        # If still nothing — function name alone is useful enough
-
-        # ── Step 5: DWARF .debug_info fallback for function name ──────────────
-        if result['function'] is None:
-            for CU in dwarf.iter_CUs():
-                for DIE in CU.iter_DIEs():
-                    if DIE.tag != 'DW_TAG_subprogram':
-                        continue
-                    try:
-                        low  = DIE.attributes.get('DW_AT_low_pc')
-                        high = DIE.attributes.get('DW_AT_high_pc')
-                        name = DIE.attributes.get('DW_AT_name')
-                        if not (low and high and name):
-                            continue
-                        lo = low.value
-                        hi = high.value if high.form == 'DW_FORM_addr' else lo + high.value
-                        for a in (clean, xtensa):
-                            if lo <= a < hi:
-                                result['function'] = name.value.decode('utf-8', errors='replace')
-                                break
-                    except Exception:
-                        continue
-                if result['function']:
-                    break
-    gc.collect()
+    result = {"address": f"0x{addr:08X}", "function": None, "file": None, "line": None}
+    # Cortex-M return addresses can have bit zero set (Thumb mode). Do NOT
+    # strip bits 30/31 of normal ESP32 PCs; these are valid flash addresses.
+    lookup = addr & ~1
+    proc = subprocess.run(
+        ["addr2line", "-f", "-C", "-e", elf_path, f"0x{lookup:08x}"],
+        capture_output=True, text=True, timeout=20, check=False
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"addr2line failed (exit {proc.returncode}): {proc.stderr[:160]}")
+    lines = proc.stdout.splitlines()
+    if len(lines) < 2:
+        raise RuntimeError("addr2line did not return function and location")
+    function = lines[0].strip()
+    location = lines[1].strip()
+    if function and function != "??":
+        result["function"] = function
+    if location and location not in ("??:0", "??:?") and ":" in location:
+        source, line = location.rsplit(":", 1)
+        if line.isdigit() and int(line) > 0:
+            # DWARF paths can contain Windows drive letters/backslashes.
+            result["file"] = source.replace(chr(92), "/").rsplit("/", 1)[-1]
+            result["line"] = int(line)
     return result
 
 # ── Stack analysis ────────────────────────────────────────────────────────────
@@ -494,7 +264,8 @@ def resolve(req: ResolveRequest, _auth=Depends(verify_secret)):
                     call_chain.append({**resolved, 'stack_offset': entry['offset']})
 
         return ResolveResponse(
-            resolved=True,
+            resolved=bool(pc_resolved and pc_resolved.get('function')),
+            reason=None if pc_resolved and pc_resolved.get('function') else 'PC address is not symbolized by this ELF',
             pc=ResolvedSymbol(**pc_resolved) if pc_resolved else None,
             lr=ResolvedSymbol(**lr_resolved) if lr_resolved else None,
             call_chain=call_chain,
