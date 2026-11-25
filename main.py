@@ -13,7 +13,6 @@ Environment variables:
 import os
 import tempfile
 import struct
-import gc
 import subprocess
 import re
 import hmac
@@ -21,7 +20,6 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-from elftools.elf.elffile import ELFFile
 from supabase import create_client
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -154,7 +152,7 @@ def download_elf(org_id: str, group_id: Optional[str],
 
     return elf_path
 
-# ── Core DWARF resolver with inline frame walking ─────────────────────────────
+# ── Native low-memory symbolization ─────────────────────────────
 
 def resolve_address(elf_path: str, addr: int) -> dict:
     """Resolve PC with GNU binutils rather than loading DWARF into Python RAM.
@@ -186,7 +184,7 @@ def resolve_address(elf_path: str, addr: int) -> dict:
         source, line = location.rsplit(":", 1)
         if line.isdigit() and int(line) > 0:
             # DWARF paths can contain Windows drive letters/backslashes.
-            result["file"] = source.replace("\\\\", "/").rsplit("/", 1)[-1]
+            result["file"] = source.replace(chr(92), "/").rsplit("/", 1)[-1]
             result["line"] = int(line)
     return result
 
